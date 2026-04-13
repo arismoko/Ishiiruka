@@ -4,15 +4,18 @@
 
 #include <array>
 #include <cstdlib>
-#include <fcntl.h>
 #include <iostream>
 #include <locale>
 #include <map>
 #include <sstream>
 #include <string>
-#include <sys/stat.h>
 #include <vector>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#endif
 
+#include "Common/Logging/Log.h"
 #include "Common/FileUtil.h"
 #include "Common/MathUtil.h"
 #include "Common/StringUtil.h"
@@ -86,13 +89,22 @@ void PopulateDevices()
     PIPE_FD fd = open(child.physicalName.c_str(), O_RDONLY | O_NONBLOCK);
     if (fd < 0)
       continue;
-    g_controller_interface.AddDevice(std::make_shared<PipeDevice>(fd, child.virtualName));
+    g_controller_interface.AddDevice(
+        std::make_shared<PipeDevice>(fd, child.virtualName, child.physicalName));
   }
   #endif
 }
 
-PipeDevice::PipeDevice(PIPE_FD fd, const std::string& name) : m_fd(fd), m_name(name)
+PipeDevice::PipeDevice(PIPE_FD fd, const std::string& name, const std::string& pipepath)
+    : m_fd(fd), m_name(name), m_pipepath(pipepath)
 {
+#ifndef _WIN32
+  // Warn if no path was supplied on POSIX: the device will work but will not
+  // be able to reopen the FIFO after all writers disconnect.
+  if (m_pipepath.empty())
+    WARN_LOG(SLIPPI, "PipeDevice '%s': no filesystem path supplied; FIFO reconnection disabled",
+             m_name.c_str());
+#endif
   for (const auto& tok : s_button_tokens)
   {
     PipeInput* btn = new PipeInput("Button " + tok);
@@ -115,7 +127,8 @@ PipeDevice::~PipeDevice()
   #ifdef _WIN32
   CloseHandle(m_fd);
   #else
-  close(m_fd);
+  if (m_fd >= 0)
+    close(m_fd);
   #endif
 }
 
@@ -163,27 +176,91 @@ s32 PipeDevice::readFromPipe(PIPE_FD file_descriptor, char *in_buffer, size_t si
 void PipeDevice::UpdateInput()
 {
   bool finished = false;
-  #ifndef _WIN32
-  if(SConfig::GetInstance().m_blockingPipes && g_needInputForFrame)
+
+#ifndef _WIN32
+  // Guard against an invalid fd left by a failed reopen attempt.
+  if (m_fd < 0)
+  {
+    // Only log once to avoid spamming the log every frame.
+    static bool s_logged = false;
+    if (!s_logged)
+    {
+      WARN_LOG(SLIPPI, "PipeDevice '%s': fd is invalid (last reopen failed); skipping updates until FIFO becomes available",
+               m_name.c_str());
+      s_logged = true;
+    }
+    return;
+  }
+#endif
+
+  // In blocking-pipes mode we must not return until we have received a FLUSH
+  // command (which signals end-of-frame) or until the pipe becomes
+  // unrecoverable.  The two platforms need different wait primitives.
+#ifdef _WIN32
+  if (SConfig::GetInstance().m_blockingPipes && g_needInputForFrame)
+  {
+    // Poll with a 1 ms sleep until at least one byte is available.
+    // This mirrors the POSIX select() block below and keeps CPU usage low.
+    while (g_needInputForFrame)
+    {
+      DWORD bytes_available = 0;
+      BOOL peek_ok = PeekNamedPipe(m_fd, NULL, 0, NULL, &bytes_available, NULL);
+      if (!peek_ok)
+      {
+        // Client disconnected; reset the pipe so a new client can connect.
+        DisconnectNamedPipe(m_fd);
+        ConnectNamedPipe(m_fd, NULL);
+        return;
+      }
+      if (bytes_available > 0)
+        break;
+      Sleep(1);
+    }
+  }
+#else
+  if (SConfig::GetInstance().m_blockingPipes && g_needInputForFrame)
   {
     fd_set set;
-    FD_ZERO (&set);
-    FD_SET (m_fd, &set);
+    FD_ZERO(&set);
+    FD_SET(m_fd, &set);
 
-    // Wait for activity on the socket
-    select(m_fd+1, &set, NULL, NULL, NULL);
+    // Block until data arrives on the FIFO.
+    select(m_fd + 1, &set, NULL, NULL, NULL);
   }
-  #endif
+#endif
+
   do
   {
-    // Read any pending characters off the pipe. If we hit a newline,
-    // then dequeue a command off the front of m_buf and parse it.
+    // Read any pending bytes off the pipe.  When we accumulate a newline,
+    // dequeue the command at the front of m_buf and parse it.
     char buf[32];
     s32 bytes_read = readFromPipe(m_fd, buf, sizeof buf);
-    if (bytes_read == 0) {
-      // Pipe died, so just quit out
+
+#ifdef _WIN32
+    // On Windows, readFromPipe returns -1 on a broken-pipe error (and
+    // already called Disconnect/ConnectNamedPipe internally).  0 means
+    // there is simply no data yet, which is fine in non-blocking mode.
+    if (bytes_read < 0)
+      return;
+#else
+    // On POSIX, read() returns 0 only when all writers have closed the
+    // FIFO (EOF).  Attempt to reopen it so that a restarted bridge can
+    // reconnect without restarting Dolphin.
+    if (bytes_read == 0)
+    {
+      if (!m_pipepath.empty())
+      {
+        close(m_fd);
+        m_fd = open(m_pipepath.c_str(), O_RDONLY | O_NONBLOCK);
+        if (m_fd < 0)
+          ERROR_LOG(SLIPPI,
+                    "PipeDevice '%s': failed to reopen FIFO '%s' after EOF (errno %d)",
+                    m_name.c_str(), m_pipepath.c_str(), errno);
+      }
       return;
     }
+#endif
+
     while (bytes_read > 0)
     {
       m_buf.append(buf, bytes_read);
@@ -198,7 +275,7 @@ void PipeDevice::UpdateInput()
       m_buf.erase(0, newline + 1);
       newline = m_buf.find("\n");
     }
-  } while(!finished && g_needInputForFrame && SConfig::GetInstance().m_blockingPipes);
+  } while (!finished && g_needInputForFrame && SConfig::GetInstance().m_blockingPipes);
 }
 
 void PipeDevice::AddAxis(const std::string& name, double value)
