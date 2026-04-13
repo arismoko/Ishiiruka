@@ -83,12 +83,13 @@ private:
   void SetAxis(const std::string& entry, double value);
   s32 readFromPipe(PIPE_FD file_descriptor, char *in_buffer, size_t size);
 
-  // m_fd is mutable on POSIX so we can reopen a closed FIFO in UpdateInput.
   PIPE_FD m_fd;
   const std::string m_name;
   // Physical filesystem path of the FIFO (POSIX only); empty on Windows.
   const std::string m_pipepath;
   std::string m_buf;
+  // True once we have logged the "fd invalid" warning for this device.
+  bool m_invalid_fd_warned = false;
   std::map<std::string, PipeInput*> m_buttons;
   std::map<std::string, PipeInput*> m_axes;
 };

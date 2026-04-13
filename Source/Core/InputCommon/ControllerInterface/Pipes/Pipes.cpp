@@ -181,16 +181,16 @@ void PipeDevice::UpdateInput()
   // Guard against an invalid fd left by a failed reopen attempt.
   if (m_fd < 0)
   {
-    // Only log once to avoid spamming the log every frame.
-    static bool s_logged = false;
-    if (!s_logged)
+    if (!m_invalid_fd_warned)
     {
       WARN_LOG(SLIPPI, "PipeDevice '%s': fd is invalid (last reopen failed); skipping updates until FIFO becomes available",
                m_name.c_str());
-      s_logged = true;
+      m_invalid_fd_warned = true;
     }
     return;
   }
+  // Reset the warning flag once the fd is valid again.
+  m_invalid_fd_warned = false;
 #endif
 
   // In blocking-pipes mode we must not return until we have received a FLUSH
